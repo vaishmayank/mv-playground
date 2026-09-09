@@ -119,7 +119,23 @@ def make_feature_table(clean_market_data):
 
         feature_parts.append(temp)
 
-    return pd.concat(feature_parts, ignore_index=True)
+    feature_table = pd.concat(feature_parts, ignore_index=True)
+    return feature_table[
+        [
+            "date",
+            "market",
+            "arrival",
+            "year",
+            "month",
+            "arrival_diff",
+            "arrival_pct_change",
+            "arrival_roll3_mean",
+            "arrival_roll12_mean",
+            "arrival_volatility_3",
+            "is_local_peak",
+            "is_local_valley",
+        ]
+    ]
 
 
 clean_market_data = load_clean_market_data()
@@ -181,7 +197,9 @@ for market, df in clean_market_data.items():
     for feature in selected_sii_features:
         relationship_value = df["arrival"].corr(df[feature])
 
-        if relationship_value > 0:
+        if abs(relationship_value) < 0.1:
+            direction = "weak or no clear linear"
+        elif relationship_value > 0:
             direction = "positive"
         elif relationship_value < 0:
             direction = "negative"
@@ -189,7 +207,7 @@ for market, df in clean_market_data.items():
             direction = "no clear linear"
 
         interpretation_note = (
-            f"{direction.capitalize()} co-movement in this market; "
+            f"{direction.capitalize()} relationship in this market; "
             "the measure suggests association, not causation, and may reflect "
             "shared trends, seasonality, or other confounding factors."
         )
