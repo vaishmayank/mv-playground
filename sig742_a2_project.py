@@ -1,3 +1,19 @@
+"""Beginner-friendly helper functions for the SIG742 A2 forecasting workflow.
+
+This module keeps the function names required by the starter notebook while
+using simple Python and pandas code. The goal is to make the logic easy to
+follow for a student who is still learning:
+
+* how to split time-series data by cutoff dates,
+* how to build naive forecasts in wide format,
+* how to validate forecast tables,
+* how to calculate MAE, MASE, and MAPE, and
+* how to create a simple deterministic improved forecasting rule.
+
+The assignment uses *wide* forecast tables, meaning:
+    one row per month, one Date column, and one column per destination.
+"""
+
 from pathlib import Path
 
 import numpy as np
@@ -20,17 +36,44 @@ VALIDATION_METRIC_COLUMNS = [
 
 
 def month_label_to_period(month_label):
-    """Convert labels like 2023M07 into a pandas monthly Period."""
+    """Convert a month label like ``2023M07`` into a pandas Period.
+
+    Parameters
+    ----------
+    month_label : str
+        Month text in the assignment format ``YYYYMmm``.
+
+    Returns
+    -------
+    pandas.Period
+        A monthly Period object, which makes month arithmetic safe.
+    """
     return pd.Period(str(month_label).replace("M", "-"), freq="M")
 
 
 def period_to_month_label(period_value):
-    """Convert a pandas monthly Period back to labels like 2023M07."""
+    """Convert a pandas monthly Period back to the assignment month label.
+
+    Parameters
+    ----------
+    period_value : pandas.Period
+        Monthly period such as ``Period('2023-07', 'M')``.
+
+    Returns
+    -------
+    str
+        Label in the format ``YYYYMmm`` such as ``2023M07``.
+    """
     return f"{period_value.year}M{period_value.month:02d}"
 
 
 def normalise_month_list(month_list):
-    """Make sure every month label is stored in the same YYYYMmm format."""
+    """Return a cleaned list of month labels in a consistent format.
+
+    This helper is useful because later validation checks compare month labels
+    by exact text. Converting every label through ``pandas.Period`` first
+    avoids small formatting inconsistencies.
+    """
     cleaned_months = []
     for month in month_list:
         period_value = month_label_to_period(month)
@@ -45,7 +88,27 @@ def build_split_objects(
     final_cutoff="2023M07",
     date_column=DATE_COLUMN,
 ):
-    """Create the three required wide tables used in the assignment."""
+    """Create the three required wide tables used in the assignment.
+
+    Parameters
+    ----------
+    raw_tourism_data : pandas.DataFrame
+        Full public dataset loaded from the approved CSV URL.
+    train_end : str
+        Last month used in the training table, for example ``2023M02``.
+    validation_months : list[str]
+        Visible validation months, for example ``2023M03`` to ``2023M07``.
+    final_cutoff : str, default ``2023M07``
+        Last public month available before the assessment forecast period.
+    date_column : str, default ``Date``
+        Name of the month-label column.
+
+    Returns
+    -------
+    tuple
+        ``(training_actual, validation_actual, public_history)`` as required
+        by the starter notebook.
+    """
     df = raw_tourism_data.copy()
     df["_month_period"] = df[date_column].apply(month_label_to_period)
 
@@ -56,6 +119,8 @@ def build_split_objects(
     for month in validation_months:
         validation_periods.append(month_label_to_period(month))
 
+    # Keep the original destination order from the public dataset so that later
+    # forecast tables also follow the required export schema.
     final_columns = [date_column]
     for column in raw_tourism_data.columns:
         if column != date_column:
@@ -76,7 +141,37 @@ def generate_naive_forecast_wide(
     lag=1,
     date_column=DATE_COLUMN,
 ):
-    """Generate a wide naive forecast table using lag values."""
+    """Generate a wide naive forecast table using a lag rule.
+
+    The assignment requires this function to work in wide format. For each
+    forecast month, the function looks back by ``lag`` months:
+
+    * if the source month is at or before the cutoff, use the observed value;
+    * if the source month is after the cutoff, use an already generated
+      forecast recursively when possible.
+
+    Parameters
+    ----------
+    historical_actual_wide : pandas.DataFrame
+        Wide table of historical actual values.
+    cutoff_label : str
+        Final month whose observed actual values may be used.
+    forecast_months : list[str]
+        Forecast months in the exact order required in the output.
+    required_destinations : list[str] or None
+        Destination columns to forecast. If ``None``, use every non-date
+        column in the input table.
+    lag : int, default 1
+        Forecast lag. ``1`` means previous month, ``12`` means same month in
+        the previous year.
+    date_column : str, default ``Date``
+        Name of the month-label column.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Wide forecast table with one row per requested forecast month.
+    """
     if not isinstance(lag, int) or lag <= 0:
         raise ValueError("lag must be a positive integer")
 
@@ -101,6 +196,8 @@ def generate_naive_forecast_wide(
     cutoff_period = month_label_to_period(cutoff_label)
     cleaned_forecast_months = normalise_month_list(forecast_months)
 
+    # Store the observed historical values in a nested dictionary so we can
+    # look them up quickly by month and destination.
     observed_values = {}
     for _, row in history.iterrows():
         this_month = row["_month_period"]
@@ -108,6 +205,8 @@ def generate_naive_forecast_wide(
         for destination in destination_columns:
             observed_values[this_month][destination] = row[destination]
 
+    # Store generated forecasts here so that recursive naive forecasts can use
+    # earlier forecasted months when the lagged source month is after cutoff.
     generated_values = {}
     output_rows = []
 
@@ -145,7 +244,18 @@ def validate_forecast_actual_wide(
     required_destinations=None,
     date_column=DATE_COLUMN,
 ):
-    """Check wide forecast tables and return the required audit dictionary."""
+    """Validate wide forecast tables and return the required Q2 audit.
+
+    The function supports two modes:
+
+    1. forecast-only mode:
+       used before exporting the final forecast CSV;
+    2. forecast-vs-actual mode:
+       used when validation actual values are available.
+
+    The returned dictionary always contains the same keys in the same order so
+    that the notebook output is predictable and easy to mark.
+    """
     if required_months is not None:
         required_months = normalise_month_list(required_months)
 
@@ -157,6 +267,8 @@ def validate_forecast_actual_wide(
     else:
         required_destinations = list(required_destinations)
 
+    # Start with the exact dictionary shape required by Q2. Each later check
+    # updates one or more fields in this dictionary.
     audit = {
         "is_valid": False,
         "can_align": None if actual_wide_df is None else False,
@@ -184,7 +296,9 @@ def validate_forecast_actual_wide(
         audit["missing_destinations_in_forecast"] = required_destinations
         return audit
 
-    forecast_months = normalise_month_list(forecast_wide_df[date_column].astype(str).tolist())
+    forecast_months = normalise_month_list(
+        forecast_wide_df[date_column].astype(str).tolist()
+    )
     forecast_month_set = set(forecast_months)
 
     if required_months is not None:
@@ -211,6 +325,8 @@ def validate_forecast_actual_wide(
         if destination in forecast_wide_df.columns:
             present_forecast_destinations.append(destination)
 
+    # Only count missing/nonnumeric/nonfinite forecast values inside the rows
+    # that are relevant for the current task.
     if required_months is None:
         forecast_scope = forecast_wide_df[present_forecast_destinations].copy()
     else:
@@ -247,6 +363,9 @@ def validate_forecast_actual_wide(
         actual_months = normalise_month_list(actual_wide_df[date_column].astype(str).tolist())
         actual_month_set = set(actual_months)
 
+        # In forecast-vs-actual mode, the actual table may contain extra months
+        # outside the evaluation window. That is allowed, but the required
+        # months must still be present.
         if required_months is None:
             actual_scope = actual_wide_df.copy()
             actual_scope_months = actual_months
@@ -349,7 +468,25 @@ def evaluate_forecast_wide(
     naive_lag=1,
     date_column=DATE_COLUMN,
 ):
-    """Calculate destination metrics and aggregate validation metrics."""
+    """Calculate destination-level and aggregate forecast measures for Q3.
+
+    Measures calculated
+    -------------------
+    MAE
+        Mean Absolute Error in the original destination units.
+    MASE
+        Mean Absolute Scaled Error, using the training-history denominator.
+    MAPE
+        Mean Absolute Percentage Error, excluding rows where the actual value
+        is zero.
+
+    Returns
+    -------
+    tuple
+        ``(destination_metrics, aggregate_metrics)`` where the first item is a
+        DataFrame and the second item is a dictionary, exactly as required by
+        the starter notebook.
+    """
     if naive_lag <= 0:
         raise ValueError("naive_lag must be a positive integer")
 
@@ -391,6 +528,7 @@ def evaluate_forecast_wide(
         if destination in training_copy.columns:
             training_copy[destination] = pd.to_numeric(training_copy[destination], errors="coerce")
 
+    # Build one row at a time so the logic stays easy to follow.
     metric_rows = []
 
     for destination in required_destinations:
@@ -404,6 +542,7 @@ def evaluate_forecast_wide(
         else:
             actual_series = pd.Series(dtype=float)
 
+        # Align forecast and actual values by month before calculating errors.
         all_months = forecast_series.index.union(actual_series.index).sort_values()
         forecast_series = forecast_series.reindex(all_months)
         actual_series = actual_series.reindex(all_months)
@@ -428,6 +567,8 @@ def evaluate_forecast_wide(
         else:
             training_series = pd.Series(dtype=float)
 
+        # MASE uses the average absolute lagged movement from the training
+        # history. We collect those absolute differences first.
         denominator_diffs = []
         if len(training_series) > naive_lag:
             values = training_series.tolist()
@@ -512,18 +653,40 @@ def evaluate_forecast_wide(
 
 
 def wide_to_long(wide_df, date_column=DATE_COLUMN, value_name="demand"):
-    """Convert wide data into long format."""
+    """Convert wide destination data into long format.
+
+    Parameters
+    ----------
+    wide_df : pandas.DataFrame
+        Wide table with one Date column and many destination columns.
+    date_column : str, default ``Date``
+        Name of the date column.
+    value_name : str, default ``demand``
+        Name to use for the melted numeric value column.
+
+    Returns
+    -------
+    pandas.DataFrame
+        Long table with columns ``Date``, ``destination``, and ``value_name``.
+    """
     long_df = wide_df.melt(id_vars=[date_column], var_name="destination", value_name=value_name)
     long_df = long_df.dropna(subset=[value_name]).reset_index(drop=True)
     return long_df
 
 
 def build_modelling_feature_table(public_history_wide, date_column=DATE_COLUMN):
-    """Create a simple feature table that is easy to inspect in the notebook."""
+    """Create a simple feature table for Q4 evidence.
+
+    This is not a complex machine-learning feature-engineering pipeline. It is
+    a readable table that shows the kinds of values the improved method can use
+    or that a student could inspect while explaining the modelling workflow.
+    """
     long_df = wide_to_long(public_history_wide, date_column=date_column, value_name="demand")
     long_df["month_period"] = long_df[date_column].apply(month_label_to_period)
     long_df = long_df.sort_values(["destination", "month_period"]).reset_index(drop=True)
 
+    # Work one destination at a time so rolling calculations do not spill
+    # across different destinations.
     feature_parts = []
     for destination, one_destination_df in long_df.groupby("destination"):
         temp = one_destination_df.copy().reset_index(drop=True)
@@ -541,7 +704,21 @@ def build_modelling_feature_table(public_history_wide, date_column=DATE_COLUMN):
 
 
 def get_clean_history_series(historical_actual_wide, destination, cutoff_label, date_column=DATE_COLUMN):
-    """Prepare one destination series for modelling."""
+    """Prepare one destination series for forecasting.
+
+    Steps
+    -----
+    1. Keep only rows up to the chosen cutoff.
+    2. Convert the destination values to numeric.
+    3. Drop missing rows at the start/end of the observed history.
+    4. Reindex to a full monthly range.
+    5. Interpolate only to fill any internal gaps.
+
+    Returns
+    -------
+    pandas.Series
+        Clean monthly series indexed by ``pandas.Period``.
+    """
     history = historical_actual_wide[[date_column, destination]].copy()
     history["_month_period"] = history[date_column].apply(month_label_to_period)
     cutoff_period = month_label_to_period(cutoff_label)
@@ -569,7 +746,20 @@ def generate_recent_drift_forecast_wide(
     cap_multiplier=1.05,
     date_column=DATE_COLUMN,
 ):
-    """Improved method: continue the recent average monthly change."""
+    """Generate the improved forecast used in Q4 and Q5.
+
+    Model idea
+    ----------
+    For each destination:
+
+    * start from the last observed actual value before the cutoff,
+    * calculate the average month-to-month change over a recent window,
+    * extend that change forward for each future month,
+    * force forecasts to stay nonnegative, and
+    * cap forecasts at a small margin above the historical maximum.
+
+    This is simple, reproducible, and easy to explain in a student notebook.
+    """
     if required_destinations is None:
         destination_columns = []
         for column in historical_actual_wide.columns:
@@ -595,6 +785,8 @@ def generate_recent_drift_forecast_wide(
 
         last_value = float(series.iloc[-1])
 
+        # Use the most recent window when possible. If the series is shorter,
+        # fall back to the available history instead of failing.
         if len(series) >= drift_window + 1:
             recent_values = series.iloc[-(drift_window + 1):].tolist()
         elif len(series) >= 2:
@@ -613,6 +805,8 @@ def generate_recent_drift_forecast_wide(
 
         cap_value = float(series.max() * cap_multiplier)
 
+        # Forecast each future month step by step. The later months get more of
+        # the accumulated drift because they are further into the future.
         forecast_values = []
         for step in range(1, len(cleaned_forecast_months) + 1):
             forecast_value = last_value + step * average_drift
@@ -636,7 +830,17 @@ def run_validation_model_suite(
     validation_months,
     date_column=DATE_COLUMN,
 ):
-    """Run the baseline models and one improved model on the validation window."""
+    """Run the model comparison used in Q4.
+
+    Models compared
+    ---------------
+    * ``naive_lag1``
+    * ``naive_lag12``
+    * ``recent_drift_6m_capped``
+
+    The final selected model is the one with the lowest mean validation MASE.
+    """
+    # These lists are later combined into the required notebook objects.
     model_rows = []
     metric_frames = []
     forecast_frames = []
@@ -739,7 +943,11 @@ def build_baseline_validation_evidence(
     validation_months,
     date_column=DATE_COLUMN,
 ):
-    """Create the two required baseline forecast tables and evaluation tables."""
+    """Create the required Part I baseline evidence tables.
+
+    Returns a dictionary so the notebook can assign each required object name
+    clearly and display the results section by section.
+    """
     lag1_forecast = generate_naive_forecast_wide(
         training_actual_wide_to_2023M02,
         cutoff_label="2023M02",
@@ -851,7 +1059,22 @@ def make_final_forecast_submission(
 
 
 def export_submission_csv(forecast_submission_wide, group_id, output_dir="."):
-    """Save the forecast table using the assignment filename pattern."""
+    """Export the final forecast table using the assignment filename pattern.
+
+    Parameters
+    ----------
+    forecast_submission_wide : pandas.DataFrame
+        Final wide forecast table that already passed the Q2 audit.
+    group_id : str
+        Student group id used in the assignment filename.
+    output_dir : str or Path, default ``.``
+        Folder where the CSV should be written.
+
+    Returns
+    -------
+    pathlib.Path
+        Full path to the written CSV file.
+    """
     if str(group_id).strip() == "":
         safe_group_id = "YourGroupID"
     else:
