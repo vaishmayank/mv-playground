@@ -1,8 +1,4 @@
-from __future__ import annotations
-
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
 
 import numpy as np
 import pandas as pd
@@ -23,146 +19,150 @@ VALIDATION_METRIC_COLUMNS = [
 ]
 
 
-def month_label_to_period(month_label: str) -> pd.Period:
+def month_label_to_period(month_label):
+    """Convert labels like 2023M07 into a pandas monthly Period."""
     return pd.Period(str(month_label).replace("M", "-"), freq="M")
 
 
-def period_to_month_label(period_value: pd.Period) -> str:
+def period_to_month_label(period_value):
+    """Convert a pandas monthly Period back to labels like 2023M07."""
     return f"{period_value.year}M{period_value.month:02d}"
 
 
-def _normalise_month_labels(months: Iterable[str]) -> list[str]:
-    return [period_to_month_label(month_label_to_period(month)) for month in months]
-
-
-def _coerce_numeric_table(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
-    coerced = df.copy()
-    for column in columns:
-        coerced[column] = pd.to_numeric(coerced[column], errors="coerce")
-    return coerced
+def normalise_month_list(month_list):
+    """Make sure every month label is stored in the same YYYYMmm format."""
+    cleaned_months = []
+    for month in month_list:
+        period_value = month_label_to_period(month)
+        cleaned_months.append(period_to_month_label(period_value))
+    return cleaned_months
 
 
 def build_split_objects(
-    raw_tourism_data: pd.DataFrame,
-    train_end: str,
-    validation_months: Sequence[str],
-    final_cutoff: str = "2023M07",
-    date_column: str = DATE_COLUMN,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    raw_with_period = raw_tourism_data.copy()
-    raw_with_period["_month_period"] = raw_with_period[date_column].map(
-        month_label_to_period
-    )
+    raw_tourism_data,
+    train_end,
+    validation_months,
+    final_cutoff="2023M07",
+    date_column=DATE_COLUMN,
+):
+    """Create the three required wide tables used in the assignment."""
+    df = raw_tourism_data.copy()
+    df["_month_period"] = df[date_column].apply(month_label_to_period)
 
-    validation_periods = [month_label_to_period(month) for month in validation_months]
     train_end_period = month_label_to_period(train_end)
     final_cutoff_period = month_label_to_period(final_cutoff)
 
-    final_columns = [date_column] + [
-        column for column in raw_tourism_data.columns if column != date_column
-    ]
+    validation_periods = []
+    for month in validation_months:
+        validation_periods.append(month_label_to_period(month))
 
-    training_actual = raw_with_period.loc[
-        raw_with_period["_month_period"] <= train_end_period,
-        final_columns,
-    ].copy()
+    final_columns = [date_column]
+    for column in raw_tourism_data.columns:
+        if column != date_column:
+            final_columns.append(column)
 
-    validation_actual = raw_with_period.loc[
-        raw_with_period["_month_period"].isin(validation_periods),
-        final_columns,
-    ].copy()
-
-    public_history = raw_with_period.loc[
-        raw_with_period["_month_period"] <= final_cutoff_period,
-        final_columns,
-    ].copy()
+    training_actual = df.loc[df["_month_period"] <= train_end_period, final_columns].copy()
+    validation_actual = df.loc[df["_month_period"].isin(validation_periods), final_columns].copy()
+    public_history = df.loc[df["_month_period"] <= final_cutoff_period, final_columns].copy()
 
     return training_actual, validation_actual, public_history
 
 
 def generate_naive_forecast_wide(
-    historical_actual_wide: pd.DataFrame,
-    cutoff_label: str,
-    forecast_months: Sequence[str],
-    required_destinations: Sequence[str] | None = None,
-    lag: int = 1,
-    date_column: str = DATE_COLUMN,
-) -> pd.DataFrame:
+    historical_actual_wide,
+    cutoff_label,
+    forecast_months,
+    required_destinations=None,
+    lag=1,
+    date_column=DATE_COLUMN,
+):
+    """Generate a wide naive forecast table using lag values."""
     if not isinstance(lag, int) or lag <= 0:
         raise ValueError("lag must be a positive integer")
+
     if date_column not in historical_actual_wide.columns:
-        raise ValueError(f"missing required date column: {date_column}")
+        raise ValueError(f"{date_column} column is missing")
 
-    forecast_months = _normalise_month_labels(forecast_months)
-    cutoff_period = month_label_to_period(cutoff_label)
-
-    destination_columns = (
-        [column for column in historical_actual_wide.columns if column != date_column]
-        if required_destinations is None
-        else list(required_destinations)
-    )
+    if required_destinations is None:
+        destination_columns = []
+        for column in historical_actual_wide.columns:
+            if column != date_column:
+                destination_columns.append(column)
+    else:
+        destination_columns = list(required_destinations)
 
     history = historical_actual_wide[[date_column] + destination_columns].copy()
-    history["_month_period"] = history[date_column].map(month_label_to_period)
-    history = _coerce_numeric_table(history, destination_columns)
+    history["_month_period"] = history[date_column].apply(month_label_to_period)
     history = history.sort_values("_month_period").reset_index(drop=True)
 
-    observed_lookup: dict[pd.Period, dict[str, float]] = {}
-    for _, row in history.iterrows():
-        observed_lookup[row["_month_period"]] = {
-            destination: row[destination] for destination in destination_columns
-        }
+    for destination in destination_columns:
+        history[destination] = pd.to_numeric(history[destination], errors="coerce")
 
-    generated_lookup: dict[pd.Period, dict[str, float]] = {}
+    cutoff_period = month_label_to_period(cutoff_label)
+    cleaned_forecast_months = normalise_month_list(forecast_months)
+
+    observed_values = {}
+    for _, row in history.iterrows():
+        this_month = row["_month_period"]
+        observed_values[this_month] = {}
+        for destination in destination_columns:
+            observed_values[this_month][destination] = row[destination]
+
+    generated_values = {}
     output_rows = []
 
-    for month_label in forecast_months:
+    for month_label in cleaned_forecast_months:
         forecast_period = month_label_to_period(month_label)
         source_period = forecast_period - lag
-        output_row = {date_column: month_label}
 
-        if source_period <= cutoff_period and source_period in observed_lookup:
-            source_values = observed_lookup[source_period]
-        elif source_period in generated_lookup:
-            source_values = generated_lookup[source_period]
-        else:
-            source_values = {destination: np.nan for destination in destination_columns}
+        row = {date_column: month_label}
 
         for destination in destination_columns:
-            output_row[destination] = source_values.get(destination, np.nan)
+            value = np.nan
 
-        generated_lookup[forecast_period] = {
-            destination: output_row[destination] for destination in destination_columns
-        }
-        output_rows.append(output_row)
+            if source_period <= cutoff_period and source_period in observed_values:
+                value = observed_values[source_period].get(destination, np.nan)
+            elif source_period in generated_values:
+                value = generated_values[source_period].get(destination, np.nan)
 
-    return pd.DataFrame(output_rows, columns=[date_column] + destination_columns)
+            row[destination] = value
+
+        generated_values[forecast_period] = {}
+        for destination in destination_columns:
+            generated_values[forecast_period][destination] = row[destination]
+
+        output_rows.append(row)
+
+    forecast_df = pd.DataFrame(output_rows)
+    forecast_df = forecast_df[[date_column] + destination_columns]
+    return forecast_df
 
 
 def validate_forecast_actual_wide(
-    forecast_wide_df: pd.DataFrame,
-    actual_wide_df: pd.DataFrame | None = None,
-    required_months: Sequence[str] | None = None,
-    required_destinations: Sequence[str] | None = None,
-    date_column: str = DATE_COLUMN,
-) -> dict:
-    required_months_list = (
-        _normalise_month_labels(required_months) if required_months is not None else None
-    )
-    destination_columns = (
-        [column for column in forecast_wide_df.columns if column != date_column]
-        if required_destinations is None
-        else list(required_destinations)
-    )
+    forecast_wide_df,
+    actual_wide_df=None,
+    required_months=None,
+    required_destinations=None,
+    date_column=DATE_COLUMN,
+):
+    """Check wide forecast tables and return the required audit dictionary."""
+    if required_months is not None:
+        required_months = normalise_month_list(required_months)
+
+    if required_destinations is None:
+        required_destinations = []
+        for column in forecast_wide_df.columns:
+            if column != date_column:
+                required_destinations.append(column)
+    else:
+        required_destinations = list(required_destinations)
 
     audit = {
         "is_valid": False,
         "can_align": None if actual_wide_df is None else False,
         "forecast_row_count": int(len(forecast_wide_df)),
         "actual_row_count": None,
-        "expected_row_count": (
-            len(required_months_list) if required_months_list is not None else None
-        ),
+        "expected_row_count": len(required_months) if required_months is not None else None,
         "missing_months_in_forecast": [],
         "missing_months_in_actual": None,
         "extra_months_in_forecast": [],
@@ -181,65 +181,53 @@ def validate_forecast_actual_wide(
     }
 
     if date_column not in forecast_wide_df.columns:
-        audit["missing_destinations_in_forecast"] = destination_columns
+        audit["missing_destinations_in_forecast"] = required_destinations
         return audit
 
-    forecast_months_source = forecast_wide_df[date_column].astype(str).tolist()
-    forecast_months_norm = _normalise_month_labels(forecast_months_source)
-    forecast_month_set = set(forecast_months_norm)
+    forecast_months = normalise_month_list(forecast_wide_df[date_column].astype(str).tolist())
+    forecast_month_set = set(forecast_months)
 
-    if required_months_list is not None:
-        required_month_set = set(required_months_list)
-        audit["missing_months_in_forecast"] = [
-            month for month in required_months_list if month not in forecast_month_set
-        ]
-        audit["extra_months_in_forecast"] = [
-            month
-            for month in forecast_months_norm
-            if month not in required_month_set
-        ]
+    if required_months is not None:
+        for month in required_months:
+            if month not in forecast_month_set:
+                audit["missing_months_in_forecast"].append(month)
 
-    audit["missing_destinations_in_forecast"] = [
-        destination
-        for destination in destination_columns
-        if destination not in forecast_wide_df.columns
-    ]
-    audit["extra_columns_in_forecast"] = [
-        column
-        for column in forecast_wide_df.columns
-        if column != date_column and column not in destination_columns
-    ]
-    audit["duplicate_forecast_dates"] = int(
-        pd.Series(forecast_months_norm).duplicated().sum()
-    )
+        for month in forecast_months:
+            if month not in required_months:
+                audit["extra_months_in_forecast"].append(month)
 
-    present_forecast_destinations = [
-        destination
-        for destination in destination_columns
-        if destination in forecast_wide_df.columns
-    ]
+    for destination in required_destinations:
+        if destination not in forecast_wide_df.columns:
+            audit["missing_destinations_in_forecast"].append(destination)
 
-    if required_months_list is None:
-        forecast_scope_mask = pd.Series(True, index=forecast_wide_df.index)
+    for column in forecast_wide_df.columns:
+        if column != date_column and column not in required_destinations:
+            audit["extra_columns_in_forecast"].append(column)
+
+    audit["duplicate_forecast_dates"] = int(pd.Series(forecast_months).duplicated().sum())
+
+    present_forecast_destinations = []
+    for destination in required_destinations:
+        if destination in forecast_wide_df.columns:
+            present_forecast_destinations.append(destination)
+
+    if required_months is None:
+        forecast_scope = forecast_wide_df[present_forecast_destinations].copy()
     else:
-        forecast_scope_mask = pd.Series(
-            forecast_months_norm, index=forecast_wide_df.index
-        ).isin(required_months_list)
+        mask = pd.Series(forecast_months, index=forecast_wide_df.index).isin(required_months)
+        forecast_scope = forecast_wide_df.loc[mask, present_forecast_destinations].copy()
 
-    forecast_scope = forecast_wide_df.loc[
-        forecast_scope_mask, present_forecast_destinations
-    ].copy()
-
-    if len(present_forecast_destinations) > 0 and len(forecast_scope) > 0:
+    if len(forecast_scope) > 0:
         audit["missing_forecast_value_count"] = int(forecast_scope.isna().sum().sum())
 
         nonnumeric_count = 0
         nonfinite_count = 0
         for destination in present_forecast_destinations:
-            original = forecast_scope[destination]
-            coerced = pd.to_numeric(original, errors="coerce")
-            nonnumeric_count += int(original.notna().sum() - coerced.notna().sum())
-            nonfinite_count += int(np.isinf(coerced.dropna()).sum())
+            original_values = forecast_scope[destination]
+            numeric_values = pd.to_numeric(original_values, errors="coerce")
+            nonnumeric_count += int(original_values.notna().sum() - numeric_values.notna().sum())
+            nonfinite_count += int(np.isinf(numeric_values.dropna()).sum())
+
         audit["nonnumeric_forecast_value_count"] = nonnumeric_count
         audit["nonfinite_forecast_value_count"] = nonfinite_count
 
@@ -253,86 +241,90 @@ def validate_forecast_actual_wide(
         audit["nonfinite_actual_value_count"] = 0
 
         if date_column not in actual_wide_df.columns:
-            audit["missing_destinations_in_actual"] = list(destination_columns)
+            audit["missing_destinations_in_actual"] = required_destinations
             return audit
 
-        actual_months_source = actual_wide_df[date_column].astype(str).tolist()
-        actual_months_norm = _normalise_month_labels(actual_months_source)
+        actual_months = normalise_month_list(actual_wide_df[date_column].astype(str).tolist())
+        actual_month_set = set(actual_months)
 
-        if required_months_list is None:
-            actual_scope_mask = pd.Series(True, index=actual_wide_df.index)
-            actual_scope_norm = actual_months_norm
+        if required_months is None:
+            actual_scope = actual_wide_df.copy()
+            actual_scope_months = actual_months
         else:
-            actual_scope_mask = pd.Series(
-                actual_months_norm, index=actual_wide_df.index
-            ).isin(required_months_list)
-            actual_scope_norm = [
-                month for month in actual_months_norm if month in required_months_list
-            ]
-            actual_month_set = set(actual_months_norm)
-            audit["missing_months_in_actual"] = [
-                month
-                for month in required_months_list
-                if month not in actual_month_set
-            ]
-            audit["extra_months_in_actual_source"] = [
-                month
-                for month in actual_months_norm
-                if month not in set(required_months_list)
-            ]
+            for month in required_months:
+                if month not in actual_month_set:
+                    audit["missing_months_in_actual"].append(month)
 
-        audit["actual_row_count"] = int(actual_scope_mask.sum())
-        audit["missing_destinations_in_actual"] = [
-            destination
-            for destination in destination_columns
-            if destination not in actual_wide_df.columns
-        ]
-        audit["duplicate_actual_dates"] = int(pd.Series(actual_scope_norm).duplicated().sum())
+            for month in actual_months:
+                if month not in required_months:
+                    audit["extra_months_in_actual_source"].append(month)
 
-        present_actual_destinations = [
-            destination
-            for destination in destination_columns
-            if destination in actual_wide_df.columns
-        ]
-        actual_scope = actual_wide_df.loc[
-            actual_scope_mask, present_actual_destinations
-        ].copy()
+            mask = pd.Series(actual_months, index=actual_wide_df.index).isin(required_months)
+            actual_scope = actual_wide_df.loc[mask].copy()
+            actual_scope_months = normalise_month_list(actual_scope[date_column].astype(str).tolist())
 
-        if len(present_actual_destinations) > 0 and len(actual_scope) > 0:
+        audit["actual_row_count"] = int(len(actual_scope))
+        audit["duplicate_actual_dates"] = int(pd.Series(actual_scope_months).duplicated().sum())
+
+        present_actual_destinations = []
+        for destination in required_destinations:
+            if destination not in actual_wide_df.columns:
+                audit["missing_destinations_in_actual"].append(destination)
+            else:
+                present_actual_destinations.append(destination)
+
+        actual_scope = actual_scope[present_actual_destinations].copy()
+
+        if len(actual_scope) > 0:
             audit["missing_actual_value_count"] = int(actual_scope.isna().sum().sum())
+
             nonnumeric_count = 0
             nonfinite_count = 0
             for destination in present_actual_destinations:
-                original = actual_scope[destination]
-                coerced = pd.to_numeric(original, errors="coerce")
-                nonnumeric_count += int(original.notna().sum() - coerced.notna().sum())
-                nonfinite_count += int(np.isinf(coerced.dropna()).sum())
+                original_values = actual_scope[destination]
+                numeric_values = pd.to_numeric(original_values, errors="coerce")
+                nonnumeric_count += int(original_values.notna().sum() - numeric_values.notna().sum())
+                nonfinite_count += int(np.isinf(numeric_values.dropna()).sum())
+
             audit["nonnumeric_actual_value_count"] = nonnumeric_count
             audit["nonfinite_actual_value_count"] = nonfinite_count
 
-        forecast_alignment_months = (
-            required_months_list if required_months_list is not None else forecast_months_norm
-        )
-        forecast_alignment_set = set(forecast_months_norm)
-        actual_alignment_set = set(actual_scope_norm)
-        forecast_has_all_required = all(
-            month in forecast_alignment_set for month in forecast_alignment_months
-        )
-        actual_has_all_required = all(
-            month in actual_alignment_set for month in forecast_alignment_months
-        )
+        if required_months is None:
+            needed_months = forecast_months
+        else:
+            needed_months = required_months
+
+        forecast_ok = True
+        actual_ok = True
+        for month in needed_months:
+            if month not in set(forecast_months):
+                forecast_ok = False
+            if month not in actual_month_set:
+                actual_ok = False
 
         audit["can_align"] = bool(
-            forecast_has_all_required
-            and actual_has_all_required
+            forecast_ok
+            and actual_ok
             and len(audit["missing_destinations_in_forecast"]) == 0
             and len(audit["missing_destinations_in_actual"]) == 0
             and audit["duplicate_forecast_dates"] == 0
             and audit["duplicate_actual_dates"] == 0
         )
 
-    actual_checks_pass = True
-    if actual_wide_df is not None:
+    forecast_checks_pass = (
+        len(audit["missing_months_in_forecast"]) == 0
+        and len(audit["extra_months_in_forecast"]) == 0
+        and len(audit["missing_destinations_in_forecast"]) == 0
+        and len(audit["extra_columns_in_forecast"]) == 0
+        and audit["duplicate_forecast_dates"] == 0
+        and audit["missing_forecast_value_count"] == 0
+        and audit["nonnumeric_forecast_value_count"] == 0
+        and audit["nonfinite_forecast_value_count"] == 0
+    )
+
+    if actual_wide_df is None:
+        audit["is_valid"] = bool(forecast_checks_pass)
+    else:
         actual_checks_pass = (
             len(audit["missing_months_in_actual"]) == 0
             and len(audit["missing_destinations_in_actual"]) == 0
@@ -342,114 +334,113 @@ def validate_forecast_actual_wide(
             and audit["nonfinite_actual_value_count"] == 0
             and audit["can_align"] is True
         )
-
-    audit["is_valid"] = bool(
-        len(audit["missing_months_in_forecast"]) == 0
-        and len(audit["extra_months_in_forecast"]) == 0
-        and len(audit["missing_destinations_in_forecast"]) == 0
-        and len(audit["extra_columns_in_forecast"]) == 0
-        and audit["duplicate_forecast_dates"] == 0
-        and audit["missing_forecast_value_count"] == 0
-        and audit["nonnumeric_forecast_value_count"] == 0
-        and audit["nonfinite_forecast_value_count"] == 0
-        and actual_checks_pass
-    )
+        audit["is_valid"] = bool(forecast_checks_pass and actual_checks_pass)
 
     return audit
 
 
 def evaluate_forecast_wide(
-    forecast_wide_df: pd.DataFrame,
-    actual_wide_df: pd.DataFrame,
-    training_actual_wide_df: pd.DataFrame,
-    start_month: str,
-    end_month: str,
-    required_destinations: Sequence[str] | None = None,
-    naive_lag: int = 1,
-    date_column: str = DATE_COLUMN,
-) -> tuple[pd.DataFrame, dict]:
+    forecast_wide_df,
+    actual_wide_df,
+    training_actual_wide_df,
+    start_month,
+    end_month,
+    required_destinations=None,
+    naive_lag=1,
+    date_column=DATE_COLUMN,
+):
+    """Calculate destination metrics and aggregate validation metrics."""
     if naive_lag <= 0:
         raise ValueError("naive_lag must be a positive integer")
 
-    forecast_destinations = [column for column in forecast_wide_df.columns if column != date_column]
-    destination_columns = (
-        forecast_destinations if required_destinations is None else list(required_destinations)
-    )
+    if required_destinations is None:
+        required_destinations = []
+        for column in forecast_wide_df.columns:
+            if column != date_column:
+                required_destinations.append(column)
+    else:
+        required_destinations = list(required_destinations)
 
     start_period = month_label_to_period(start_month)
     end_period = month_label_to_period(end_month)
 
-    def _prepare_eval_table(df: pd.DataFrame, destinations: Sequence[str]) -> pd.DataFrame:
-        output = df[[date_column] + [destination for destination in destinations if destination in df.columns]].copy()
-        output["_month_period"] = output[date_column].map(month_label_to_period)
-        output = output.loc[
-            output["_month_period"].between(start_period, end_period)
-        ].copy()
-        output = output.sort_values("_month_period").reset_index(drop=True)
-        return _coerce_numeric_table(
-            output, [destination for destination in destinations if destination in output.columns]
-        )
+    forecast_copy = forecast_wide_df.copy()
+    actual_copy = actual_wide_df.copy()
+    training_copy = training_actual_wide_df.copy()
 
-    forecast_eval = _prepare_eval_table(forecast_wide_df, destination_columns)
-    actual_eval = _prepare_eval_table(actual_wide_df, destination_columns)
+    forecast_copy["_month_period"] = forecast_copy[date_column].apply(month_label_to_period)
+    actual_copy["_month_period"] = actual_copy[date_column].apply(month_label_to_period)
+    training_copy["_month_period"] = training_copy[date_column].apply(month_label_to_period)
 
-    training = training_actual_wide_df.copy()
-    training["_month_period"] = training[date_column].map(month_label_to_period)
-    training = training.sort_values("_month_period").reset_index(drop=True)
-    training = _coerce_numeric_table(
-        training,
-        [destination for destination in destination_columns if destination in training.columns],
-    )
+    forecast_copy = forecast_copy.loc[
+        forecast_copy["_month_period"].between(start_period, end_period)
+    ].copy()
+    actual_copy = actual_copy.loc[
+        actual_copy["_month_period"].between(start_period, end_period)
+    ].copy()
 
-    forecast_series_by_destination = {
-        destination: forecast_eval.set_index("_month_period")[destination]
-        for destination in destination_columns
-        if destination in forecast_eval.columns
-    }
-    actual_series_by_destination = {
-        destination: actual_eval.set_index("_month_period")[destination]
-        for destination in destination_columns
-        if destination in actual_eval.columns
-    }
+    forecast_copy = forecast_copy.sort_values("_month_period")
+    actual_copy = actual_copy.sort_values("_month_period")
+    training_copy = training_copy.sort_values("_month_period")
 
-    metrics_rows = []
-    for destination in destination_columns:
-        forecast_series = forecast_series_by_destination.get(destination, pd.Series(dtype=float))
-        actual_series = actual_series_by_destination.get(destination, pd.Series(dtype=float))
+    for destination in required_destinations:
+        if destination in forecast_copy.columns:
+            forecast_copy[destination] = pd.to_numeric(forecast_copy[destination], errors="coerce")
+        if destination in actual_copy.columns:
+            actual_copy[destination] = pd.to_numeric(actual_copy[destination], errors="coerce")
+        if destination in training_copy.columns:
+            training_copy[destination] = pd.to_numeric(training_copy[destination], errors="coerce")
 
-        aligned_index = forecast_series.index.union(actual_series.index).sort_values()
-        forecast_aligned = forecast_series.reindex(aligned_index)
-        actual_aligned = actual_series.reindex(aligned_index)
+    metric_rows = []
+
+    for destination in required_destinations:
+        if destination in forecast_copy.columns:
+            forecast_series = forecast_copy.set_index("_month_period")[destination]
+        else:
+            forecast_series = pd.Series(dtype=float)
+
+        if destination in actual_copy.columns:
+            actual_series = actual_copy.set_index("_month_period")[destination]
+        else:
+            actual_series = pd.Series(dtype=float)
+
+        all_months = forecast_series.index.union(actual_series.index).sort_values()
+        forecast_series = forecast_series.reindex(all_months)
+        actual_series = actual_series.reindex(all_months)
 
         valid_mask = (
-            forecast_aligned.notna()
-            & actual_aligned.notna()
-            & np.isfinite(forecast_aligned)
-            & np.isfinite(actual_aligned)
+            forecast_series.notna()
+            & actual_series.notna()
+            & np.isfinite(forecast_series)
+            & np.isfinite(actual_series)
         )
+
         n = int(valid_mask.sum())
+        if n > 0:
+            mae = float(np.abs(actual_series[valid_mask] - forecast_series[valid_mask]).mean())
+        else:
+            mae = np.nan
 
-        mae = float(np.abs(actual_aligned[valid_mask] - forecast_aligned[valid_mask]).mean()) if n > 0 else np.nan
+        if destination in training_copy.columns:
+            training_series = training_copy[["_month_period", destination]].dropna()
+            training_series = training_series.set_index("_month_period")[destination]
+            training_series = training_series[np.isfinite(training_series)]
+        else:
+            training_series = pd.Series(dtype=float)
 
-        training_series = (
-            training[[date_column, "_month_period", destination]]
-            .dropna(subset=[destination])
-            .set_index("_month_period")[destination]
-            if destination in training.columns
-            else pd.Series(dtype=float)
-        )
-        training_series = training_series[np.isfinite(training_series)]
-
-        valid_pairs = []
+        denominator_diffs = []
         if len(training_series) > naive_lag:
-            for idx in range(naive_lag, len(training_series)):
-                current_value = training_series.iloc[idx]
-                lag_value = training_series.iloc[idx - naive_lag]
-                if np.isfinite(current_value) and np.isfinite(lag_value):
-                    valid_pairs.append(abs(current_value - lag_value))
+            values = training_series.tolist()
+            for i in range(naive_lag, len(values)):
+                current_value = values[i]
+                old_value = values[i - naive_lag]
+                denominator_diffs.append(abs(current_value - old_value))
 
-        n_denominator_pairs = int(len(valid_pairs))
-        denominator = float(np.mean(valid_pairs)) if n_denominator_pairs > 0 else np.nan
+        n_denominator_pairs = len(denominator_diffs)
+        if n_denominator_pairs > 0:
+            denominator = float(np.mean(denominator_diffs))
+        else:
+            denominator = np.nan
 
         if n_denominator_pairs == 0:
             mase = np.nan
@@ -468,14 +459,20 @@ def evaluate_forecast_wide(
             mase_available = True
             denominator_warning = ""
 
-        mape_mask = valid_mask & (actual_aligned != 0)
-        mape = (
-            float(np.abs((actual_aligned[mape_mask] - forecast_aligned[mape_mask]) / actual_aligned[mape_mask]).mean() * 100)
-            if int(mape_mask.sum()) > 0
-            else np.nan
-        )
+        mape_values = []
+        for i in range(len(all_months)):
+            if valid_mask.iloc[i]:
+                actual_value = actual_series.iloc[i]
+                forecast_value = forecast_series.iloc[i]
+                if actual_value != 0:
+                    mape_values.append(abs(actual_value - forecast_value) / abs(actual_value) * 100)
 
-        metrics_rows.append(
+        if len(mape_values) > 0:
+            mape = float(np.mean(mape_values))
+        else:
+            mape = np.nan
+
+        metric_rows.append(
             {
                 "destination": destination,
                 "n": n,
@@ -489,7 +486,7 @@ def evaluate_forecast_wide(
             }
         )
 
-    destination_metrics = pd.DataFrame(metrics_rows)
+    destination_metrics = pd.DataFrame(metric_rows)
     destination_metrics = destination_metrics[
         [
             "destination",
@@ -514,61 +511,49 @@ def evaluate_forecast_wide(
     return destination_metrics, aggregate_metrics
 
 
-def wide_to_long(
-    wide_df: pd.DataFrame,
-    date_column: str = DATE_COLUMN,
-    value_name: str = "demand",
-) -> pd.DataFrame:
-    long_df = wide_df.melt(
-        id_vars=[date_column],
-        var_name="destination",
-        value_name=value_name,
-    )
-    return long_df.dropna(subset=[value_name]).reset_index(drop=True)
-
-
-def build_modelling_feature_table(
-    public_history_wide: pd.DataFrame,
-    date_column: str = DATE_COLUMN,
-) -> pd.DataFrame:
-    long_df = wide_to_long(public_history_wide, date_column=date_column, value_name="demand")
-    long_df["month_period"] = long_df[date_column].map(month_label_to_period)
-    long_df = long_df.sort_values(["destination", "month_period"]).reset_index(drop=True)
-
-    grouped = long_df.groupby("destination", group_keys=False)
-    long_df["lag1"] = grouped["demand"].shift(1)
-    long_df["lag12"] = grouped["demand"].shift(12)
-    long_df["diff1"] = grouped["demand"].diff(1)
-    long_df["roll3_mean"] = grouped["demand"].transform(
-        lambda series: series.rolling(3, min_periods=3).mean()
-    )
-    long_df["roll6_mean"] = grouped["demand"].transform(
-        lambda series: series.rolling(6, min_periods=6).mean()
-    )
-    long_df["roll12_mean"] = grouped["demand"].transform(
-        lambda series: series.rolling(12, min_periods=12).mean()
-    )
-    long_df["recent_drift_6"] = grouped["diff1"].transform(
-        lambda series: series.rolling(6, min_periods=6).mean()
-    )
+def wide_to_long(wide_df, date_column=DATE_COLUMN, value_name="demand"):
+    """Convert wide data into long format."""
+    long_df = wide_df.melt(id_vars=[date_column], var_name="destination", value_name=value_name)
+    long_df = long_df.dropna(subset=[value_name]).reset_index(drop=True)
     return long_df
 
 
-def _prepare_history_series(
-    historical_actual_wide: pd.DataFrame,
-    destination: str,
-    cutoff_label: str,
-    date_column: str = DATE_COLUMN,
-) -> pd.Series:
+def build_modelling_feature_table(public_history_wide, date_column=DATE_COLUMN):
+    """Create a simple feature table that is easy to inspect in the notebook."""
+    long_df = wide_to_long(public_history_wide, date_column=date_column, value_name="demand")
+    long_df["month_period"] = long_df[date_column].apply(month_label_to_period)
+    long_df = long_df.sort_values(["destination", "month_period"]).reset_index(drop=True)
+
+    feature_parts = []
+    for destination, one_destination_df in long_df.groupby("destination"):
+        temp = one_destination_df.copy().reset_index(drop=True)
+        temp["lag1"] = temp["demand"].shift(1)
+        temp["lag12"] = temp["demand"].shift(12)
+        temp["diff1"] = temp["demand"].diff(1)
+        temp["roll3_mean"] = temp["demand"].rolling(3, min_periods=3).mean()
+        temp["roll6_mean"] = temp["demand"].rolling(6, min_periods=6).mean()
+        temp["roll12_mean"] = temp["demand"].rolling(12, min_periods=12).mean()
+        temp["recent_drift_6"] = temp["diff1"].rolling(6, min_periods=6).mean()
+        feature_parts.append(temp)
+
+    feature_table = pd.concat(feature_parts, ignore_index=True)
+    return feature_table
+
+
+def get_clean_history_series(historical_actual_wide, destination, cutoff_label, date_column=DATE_COLUMN):
+    """Prepare one destination series for modelling."""
     history = historical_actual_wide[[date_column, destination]].copy()
-    history["_month_period"] = history[date_column].map(month_label_to_period)
+    history["_month_period"] = history[date_column].apply(month_label_to_period)
     cutoff_period = month_label_to_period(cutoff_label)
     history = history.loc[history["_month_period"] <= cutoff_period].copy()
+
     history[destination] = pd.to_numeric(history[destination], errors="coerce")
     history = history.dropna(subset=[destination]).sort_values("_month_period")
-    series = history.set_index("_month_period")[destination].astype(float)
-    if series.empty:
-        return series
+
+    if len(history) == 0:
+        return pd.Series(dtype=float)
+
+    series = history.set_index("_month_period")[destination]
     full_index = pd.period_range(series.index.min(), series.index.max(), freq="M")
     series = series.reindex(full_index)
     series = series.interpolate(limit_direction="both")
@@ -576,114 +561,124 @@ def _prepare_history_series(
 
 
 def generate_recent_drift_forecast_wide(
-    historical_actual_wide: pd.DataFrame,
-    cutoff_label: str,
-    forecast_months: Sequence[str],
-    required_destinations: Sequence[str] | None = None,
-    drift_window: int = 6,
-    cap_multiplier: float = 1.05,
-    date_column: str = DATE_COLUMN,
-) -> pd.DataFrame:
-    if drift_window < 1:
-        raise ValueError("drift_window must be at least 1")
+    historical_actual_wide,
+    cutoff_label,
+    forecast_months,
+    required_destinations=None,
+    drift_window=6,
+    cap_multiplier=1.05,
+    date_column=DATE_COLUMN,
+):
+    """Improved method: continue the recent average monthly change."""
+    if required_destinations is None:
+        destination_columns = []
+        for column in historical_actual_wide.columns:
+            if column != date_column:
+                destination_columns.append(column)
+    else:
+        destination_columns = list(required_destinations)
 
-    destination_columns = (
-        [column for column in historical_actual_wide.columns if column != date_column]
-        if required_destinations is None
-        else list(required_destinations)
-    )
-    forecast_periods = [month_label_to_period(month) for month in forecast_months]
-
-    output = {date_column: [period_to_month_label(period) for period in forecast_periods]}
+    cleaned_forecast_months = normalise_month_list(forecast_months)
+    output = {date_column: cleaned_forecast_months}
 
     for destination in destination_columns:
-        series = _prepare_history_series(
+        series = get_clean_history_series(
             historical_actual_wide,
-            destination=destination,
-            cutoff_label=cutoff_label,
+            destination,
+            cutoff_label,
             date_column=date_column,
         )
-        if series.empty:
-            output[destination] = [np.nan] * len(forecast_periods)
+
+        if len(series) == 0:
+            output[destination] = [np.nan] * len(cleaned_forecast_months)
             continue
 
         last_value = float(series.iloc[-1])
+
         if len(series) >= drift_window + 1:
-            recent_diffs = np.diff(series.iloc[-(drift_window + 1) :].to_numpy())
+            recent_values = series.iloc[-(drift_window + 1):].tolist()
         elif len(series) >= 2:
-            recent_diffs = np.diff(series.to_numpy())
+            recent_values = series.tolist()
         else:
-            recent_diffs = np.array([0.0])
-        drift_value = float(np.nanmean(recent_diffs)) if len(recent_diffs) > 0 else 0.0
+            recent_values = [last_value, last_value]
+
+        recent_diffs = []
+        for i in range(1, len(recent_values)):
+            recent_diffs.append(recent_values[i] - recent_values[i - 1])
+
+        if len(recent_diffs) == 0:
+            average_drift = 0.0
+        else:
+            average_drift = float(np.mean(recent_diffs))
+
         cap_value = float(series.max() * cap_multiplier)
 
-        forecasts = []
-        for step in range(1, len(forecast_periods) + 1):
-            forecast_value = last_value + step * drift_value
-            forecast_value = min(max(0.0, forecast_value), cap_value)
-            forecasts.append(float(forecast_value))
+        forecast_values = []
+        for step in range(1, len(cleaned_forecast_months) + 1):
+            forecast_value = last_value + step * average_drift
+            if forecast_value < 0:
+                forecast_value = 0.0
+            if forecast_value > cap_value:
+                forecast_value = cap_value
+            forecast_values.append(float(forecast_value))
 
-        output[destination] = forecasts
+        output[destination] = forecast_values
 
-    return pd.DataFrame(output, columns=[date_column] + destination_columns)
+    forecast_df = pd.DataFrame(output)
+    forecast_df = forecast_df[[date_column] + destination_columns]
+    return forecast_df
 
 
 def run_validation_model_suite(
-    training_actual_wide_to_2023M02: pd.DataFrame,
-    validation_actual_wide_2023M03_2023M07: pd.DataFrame,
-    required_destinations: Sequence[str],
-    validation_months: Sequence[str],
-    date_column: str = DATE_COLUMN,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    model_specs = [
-        {
-            "model_label": "naive_lag1",
-            "model_family": "naive_recursive",
-            "generator": lambda: generate_naive_forecast_wide(
-                historical_actual_wide=training_actual_wide_to_2023M02,
+    training_actual_wide_to_2023M02,
+    validation_actual_wide_2023M03_2023M07,
+    required_destinations,
+    validation_months,
+    date_column=DATE_COLUMN,
+):
+    """Run the baseline models and one improved model on the validation window."""
+    model_rows = []
+    metric_frames = []
+    forecast_frames = []
+
+    model_names = ["naive_lag1", "naive_lag12", "recent_drift_6m_capped"]
+
+    for model_name in model_names:
+        if model_name == "naive_lag1":
+            forecast_wide = generate_naive_forecast_wide(
+                training_actual_wide_to_2023M02,
                 cutoff_label="2023M02",
                 forecast_months=validation_months,
                 required_destinations=required_destinations,
                 lag=1,
                 date_column=date_column,
-            ),
-        },
-        {
-            "model_label": "naive_lag12",
-            "model_family": "seasonal_naive",
-            "generator": lambda: generate_naive_forecast_wide(
-                historical_actual_wide=training_actual_wide_to_2023M02,
+            )
+            model_family = "naive_recursive"
+        elif model_name == "naive_lag12":
+            forecast_wide = generate_naive_forecast_wide(
+                training_actual_wide_to_2023M02,
                 cutoff_label="2023M02",
                 forecast_months=validation_months,
                 required_destinations=required_destinations,
                 lag=12,
                 date_column=date_column,
-            ),
-        },
-        {
-            "model_label": "recent_drift_6m_capped",
-            "model_family": "recent_linear_drift",
-            "generator": lambda: generate_recent_drift_forecast_wide(
-                historical_actual_wide=training_actual_wide_to_2023M02,
+            )
+            model_family = "seasonal_naive"
+        else:
+            forecast_wide = generate_recent_drift_forecast_wide(
+                training_actual_wide_to_2023M02,
                 cutoff_label="2023M02",
                 forecast_months=validation_months,
                 required_destinations=required_destinations,
                 drift_window=6,
                 cap_multiplier=1.05,
                 date_column=date_column,
-            ),
-        },
-    ]
+            )
+            model_family = "recent_linear_drift"
 
-    validation_forecast_rows = []
-    validation_metric_frames = []
-    model_summary_rows = []
-
-    for spec in model_specs:
-        forecast_wide = spec["generator"]()
         forecast_long = wide_to_long(forecast_wide, date_column=date_column, value_name="forecast")
-        forecast_long.insert(0, "model_label", spec["model_label"])
-        validation_forecast_rows.append(forecast_long)
+        forecast_long.insert(0, "model_label", model_name)
+        forecast_frames.append(forecast_long)
 
         destination_metrics, aggregate_metrics = evaluate_forecast_wide(
             forecast_wide_df=forecast_wide,
@@ -695,14 +690,14 @@ def run_validation_model_suite(
             naive_lag=1,
             date_column=date_column,
         )
-        metrics_with_label = destination_metrics.copy()
-        metrics_with_label.insert(0, "model_label", spec["model_label"])
-        validation_metric_frames.append(metrics_with_label)
 
-        model_summary_rows.append(
+        destination_metrics.insert(0, "model_label", model_name)
+        metric_frames.append(destination_metrics)
+
+        model_rows.append(
             {
-                "model_label": spec["model_label"],
-                "model_family": spec["model_family"],
+                "model_label": model_name,
+                "model_family": model_family,
                 "n_destinations": aggregate_metrics["n_destinations"],
                 "mean_mase": aggregate_metrics["mean_mase"],
                 "median_mase": aggregate_metrics["median_mase"],
@@ -714,39 +709,39 @@ def run_validation_model_suite(
             }
         )
 
-    validation_forecasts = pd.concat(validation_forecast_rows, ignore_index=True)[
-        ["model_label", "Date", "destination", "forecast"]
-    ]
-    validation_metrics = pd.concat(validation_metric_frames, ignore_index=True)[
-        VALIDATION_METRIC_COLUMNS
-    ]
-    model_summary = pd.DataFrame(model_summary_rows)
+    validation_forecasts = pd.concat(forecast_frames, ignore_index=True)
+    validation_forecasts = validation_forecasts[["model_label", "Date", "destination", "forecast"]]
 
-    best_row_index = model_summary["mean_mase"].astype(float).idxmin()
-    model_summary.loc[best_row_index, "selected"] = True
-    model_summary.loc[best_row_index, "selection_rationale"] = (
-        "Selected because it achieved the lowest mean validation MASE while "
-        "keeping MAPE lower than both naive baselines."
+    validation_metrics = pd.concat(metric_frames, ignore_index=True)
+    validation_metrics = validation_metrics[VALIDATION_METRIC_COLUMNS]
+
+    model_summary = pd.DataFrame(model_rows)
+    best_index = model_summary["mean_mase"].idxmin()
+    model_summary.loc[best_index, "selected"] = True
+    model_summary.loc[best_index, "selection_rationale"] = (
+        "Selected because it gave the lowest mean validation MASE and also kept "
+        "mean MAPE below both naive baselines."
     )
     model_summary["reproducibility_notes"] = (
-        "No stochastic steps were used; reruns with the same public data reproduce the same forecasts."
+        "The workflow is deterministic, so rerunning the notebook gives the same result."
     )
     model_summary["stability_notes"] = (
-        "Forecast rules are deterministic, destination-specific, nonnegative, and capped at 105% of each series historical maximum."
+        "Forecasts are destination-specific, nonnegative, and capped at 105% of each destination historical maximum."
     )
 
     return validation_forecasts, validation_metrics, model_summary
 
 
 def build_baseline_validation_evidence(
-    training_actual_wide_to_2023M02: pd.DataFrame,
-    validation_actual_wide_2023M03_2023M07: pd.DataFrame,
-    required_destinations: Sequence[str],
-    validation_months: Sequence[str],
-    date_column: str = DATE_COLUMN,
-) -> dict[str, object]:
+    training_actual_wide_to_2023M02,
+    validation_actual_wide_2023M03_2023M07,
+    required_destinations,
+    validation_months,
+    date_column=DATE_COLUMN,
+):
+    """Create the two required baseline forecast tables and evaluation tables."""
     lag1_forecast = generate_naive_forecast_wide(
-        historical_actual_wide=training_actual_wide_to_2023M02,
+        training_actual_wide_to_2023M02,
         cutoff_label="2023M02",
         forecast_months=validation_months,
         required_destinations=required_destinations,
@@ -754,7 +749,7 @@ def build_baseline_validation_evidence(
         date_column=date_column,
     )
     lag12_forecast = generate_naive_forecast_wide(
-        historical_actual_wide=training_actual_wide_to_2023M02,
+        training_actual_wide_to_2023M02,
         cutoff_label="2023M02",
         forecast_months=validation_months,
         required_destinations=required_destinations,
@@ -798,29 +793,31 @@ def build_baseline_validation_evidence(
         date_column=date_column,
     )
 
-    lag1_metrics = lag1_metrics.copy()
     lag1_metrics.insert(0, "lag", 1)
     lag1_metrics.insert(0, "model_label", "naive_lag1")
 
-    lag12_metrics = lag12_metrics.copy()
     lag12_metrics.insert(0, "lag", 12)
     lag12_metrics.insert(0, "model_label", "naive_lag12")
 
-    baseline_validation_comparison = pd.concat(
-        [lag1_metrics, lag12_metrics], ignore_index=True
-    )
+    baseline_validation_comparison = pd.concat([lag1_metrics, lag12_metrics], ignore_index=True)
 
     baseline_validation_summary = pd.DataFrame(
         [
             {
                 "model_label": "naive_lag1",
                 "lag": 1,
-                **lag1_summary,
+                "n_destinations": lag1_summary["n_destinations"],
+                "mean_mase": lag1_summary["mean_mase"],
+                "median_mase": lag1_summary["median_mase"],
+                "mean_mape": lag1_summary["mean_mape"],
             },
             {
                 "model_label": "naive_lag12",
                 "lag": 12,
-                **lag12_summary,
+                "n_destinations": lag12_summary["n_destinations"],
+                "mean_mase": lag12_summary["mean_mase"],
+                "median_mase": lag12_summary["median_mase"],
+                "mean_mape": lag12_summary["mean_mape"],
             },
         ]
     )
@@ -836,13 +833,14 @@ def build_baseline_validation_evidence(
 
 
 def make_final_forecast_submission(
-    public_history_wide_to_2023M07: pd.DataFrame,
-    forecast_months: Sequence[str],
-    required_destinations: Sequence[str],
-    date_column: str = DATE_COLUMN,
-) -> pd.DataFrame:
+    public_history_wide_to_2023M07,
+    forecast_months,
+    required_destinations,
+    date_column=DATE_COLUMN,
+):
+    """Create the final 12-month forecast table using the selected model."""
     return generate_recent_drift_forecast_wide(
-        historical_actual_wide=public_history_wide_to_2023M07,
+        public_history_wide_to_2023M07,
         cutoff_label="2023M07",
         forecast_months=forecast_months,
         required_destinations=required_destinations,
@@ -852,12 +850,13 @@ def make_final_forecast_submission(
     )
 
 
-def export_submission_csv(
-    forecast_submission_wide: pd.DataFrame,
-    group_id: str,
-    output_dir: str | Path = ".",
-) -> Path:
-    safe_group_id = group_id if str(group_id).strip() else "YourGroupID"
+def export_submission_csv(forecast_submission_wide, group_id, output_dir="."):
+    """Save the forecast table using the assignment filename pattern."""
+    if str(group_id).strip() == "":
+        safe_group_id = "YourGroupID"
+    else:
+        safe_group_id = str(group_id).strip()
+
     output_path = Path(output_dir) / f"SIG742-2026T2-A2-{safe_group_id}-Forecast.csv"
     forecast_submission_wide.to_csv(output_path, index=False)
     return output_path
